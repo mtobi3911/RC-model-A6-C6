@@ -1,0 +1,331 @@
+// ============================================================================
+// Audi A6 C6 RC Project
+// Receiver.ino
+// Version 3.2.0 (ESP32-C3 SuperMini, без туманок, телеметрия, failsafe)
+// ============================================================================
+#include <WiFi.h>
+#include <esp_now.h>
+#include <ESP32Servo.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ============================================================================
+// REMOTE MAC (ВПИШИТЕ MAC ПУЛЬТА!)
+// ============================================================================
+uint8_t remoteMac[] = 
+{ 
+	0xA8, 0x46, 0x74, 0x78, 0x94, 0x90
+};
+
+// ============================================================================
+// PINOUT (ESP32-C3 SuperMini) - идентично пульту где возможно
+// ============================================================================
+#define SERVO_PIN          8
+#define MOTOR_IN1          2
+#define MOTOR_IN2          3
+#define LOW_BEAM_PIN       4
+#define HIGH_BEAM_PIN      5
+#define LEFT_PIN           6
+#define RIGHT_PIN          7
+#define TAIL_PIN           10
+#define REVERSE_PIN        1
+#define HALL_PIN           0
+#define TEMP_PIN           9
+
+// ============================================================================
+// SETTINGS
+// ============================================================================
+#define SIGNAL_TIMEOUT    800
+#define BLINK_INTERVAL    500
+#define SERVO_FILTER      0.20f
+#define MOTOR_DEADZONE    40
+#define BRAKE_BRIGHTNESS  255
+#define TAIL_BRIGHTNESS    70
+
+// ============================================================================
+// PACKETS (без fog, как в пульте)
+// ============================================================================
+typedef struct 
+{
+    uint16_t throttle;
+    uint16_t steering;
+    bool lowBeam;
+    bool highBeam;
+    bool leftBlink;
+    bool rightBlink;
+    bool hazard;
+    bool horn;
+    uint8_t reserved;
+} Packet;
+
+typedef struct 
+{
+    float temperature;
+    uint32_t rpm;
+} TelemetryPacket;
+
+// ============================================================================
+// VARIABLES
+// ============================================================================
+Packet rx;
+TelemetryPacket telemetryTx;
+
+Servo steeringServo;
+OneWire oneWire(TEMP_PIN);
+DallasTemperature sensors(&oneWire);
+
+volatile uint32_t hallCounter = 0;
+unsigned long lastPacketTime = 0;
+unsigned long blinkTimer = 0;
+bool blinkState = false;
+
+float servoFiltered = 90.0f;
+bool reverseEnabled = false;
+bool brakeMode = false;
+
+float motorTemperature = 0.0f;
+uint32_t motorRPM = 0;
+
+bool failsafeActive = false;
+
+// ============================================================================
+// CALLBACKS & INTERRUPTS
+// ============================================================================
+void IRAM_ATTR hallInterrupt() 
+{
+    hallCounter++;
+}
+
+void onReceive(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) 
+{
+    if(len != sizeof(Packet)) return;
+    memcpy(&rx, incomingData, sizeof(Packet));
+    lastPacketTime = millis();
+    failsafeActive = false;
+}
+
+// ============================================================================
+// SETUP
+// ============================================================================
+void setup() 
+{
+    Serial.begin(115200);
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+
+    steeringServo.setPeriodHertz(50);
+    steeringServo.attach(SERVO_PIN, 500, 2400);
+
+    pinMode(LOW_BEAM_PIN, OUTPUT);
+    pinMode(HIGH_BEAM_PIN, OUTPUT);
+    pinMode(LEFT_PIN, OUTPUT);
+    pinMode(RIGHT_PIN, OUTPUT);
+    pinMode(TAIL_PIN, OUTPUT);
+    pinMode(REVERSE_PIN, OUTPUT);
+    pinMode(MOTOR_IN1, OUTPUT);
+    pinMode(MOTOR_IN2, OUTPUT);
+    
+    pinMode(HALL_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(HALL_PIN), hallInterrupt, FALLING);
+
+    sensors.begin();
+
+    if(esp_now_init() != ESP_OK) 
+    {
+        Serial.println("ESP-NOW init failed");
+        while(true);
+    }
+
+    esp_now_register_recv_cb(onReceive);
+
+    // Регистрируем пульт как peer для отправки телеметрии
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, remoteMac, 6);
+    peer.channel = 0;
+    peer.encrypt = false;
+    if (esp_now_add_peer(&peer) != ESP_OK) 
+    {
+        Serial.println("Failed to add remote peer");
+    }
+}
+
+// ============================================================================
+// CONTROL FUNCTIONS
+// ============================================================================
+void updateServo() 
+{
+    int angle = map(rx.steering, 0, 4095, 0, 180);
+    servoFiltered = servoFiltered * (1.0f - SERVO_FILTER) + angle * SERVO_FILTER;
+    steeringServo.write(constrain(servoFiltered, 0, 180));
+}
+
+void updateLights() 
+{
+    digitalWrite(LOW_BEAM_PIN, rx.lowBeam);
+    digitalWrite(HIGH_BEAM_PIN, rx.highBeam);
+
+    if(millis() - blinkTimer > BLINK_INTERVAL) 
+    {
+        blinkTimer = millis();
+        blinkState = !blinkState;
+    }
+
+    bool left = false;
+    bool right = false;
+
+    if(rx.hazard || failsafeActive) 
+    {
+        left = blinkState;
+        right = blinkState;
+    } 
+    else 
+    {
+        left = rx.leftBlink && blinkState;
+        right = rx.rightBlink && blinkState;
+    }
+
+    digitalWrite(LEFT_PIN, left);
+    digitalWrite(RIGHT_PIN, right);
+}
+
+void stopMotor() 
+{
+    digitalWrite(MOTOR_IN1, LOW);
+    digitalWrite(MOTOR_IN2, LOW);
+}
+
+void motorForward(uint8_t pwm) 
+{
+    analogWrite(MOTOR_IN1, pwm);
+    digitalWrite(MOTOR_IN2, LOW);
+}
+
+void motorReverse(uint8_t pwm) 
+{
+    digitalWrite(MOTOR_IN1, LOW);
+    analogWrite(MOTOR_IN2, pwm);
+}
+
+void updateMotor() 
+{
+    int value = map(rx.throttle, 0, 4095, -255, 255);
+
+    if(abs(value) < MOTOR_DEADZONE) 
+    {
+        stopMotor();
+        brakeMode = false;
+        analogWrite(TAIL_PIN, TAIL_BRIGHTNESS);
+        digitalWrite(REVERSE_PIN, LOW);
+        reverseEnabled = true; 
+        return;
+    }
+
+    if(value > 0) 
+    {
+        reverseEnabled = false; 
+        brakeMode = false;
+        motorForward(value);
+        analogWrite(TAIL_PIN, TAIL_BRIGHTNESS);
+        digitalWrite(REVERSE_PIN, LOW);
+        return;
+    }
+
+    if(value < 0) 
+    {
+        if(!reverseEnabled) 
+        {
+            stopMotor();
+            brakeMode = true;
+            analogWrite(TAIL_PIN, BRAKE_BRIGHTNESS);
+            digitalWrite(REVERSE_PIN, LOW);
+            return; 
+        }
+
+        brakeMode = false;
+        motorReverse(abs(value));
+        analogWrite(TAIL_PIN, TAIL_BRIGHTNESS);
+        digitalWrite(REVERSE_PIN, HIGH);
+    }
+}
+
+void updateTelemetry() 
+{
+    static unsigned long tempTimer = 0;
+    static unsigned long rpmTimer = 0;
+    bool needSend = false;
+
+    if(millis() - tempTimer > 1000) 
+    {
+        tempTimer = millis();
+        sensors.requestTemperatures();
+        motorTemperature = sensors.getTempCByIndex(0);
+        needSend = true;
+    }
+
+    if(millis() - rpmTimer > 1000) 
+    {
+        rpmTimer = millis();
+        noInterrupts();
+        uint32_t pulses = hallCounter;
+        hallCounter = 0;
+        interrupts();
+        motorRPM = pulses * 60;
+        needSend = true;
+    }
+
+    if(needSend) 
+    {
+        telemetryTx.temperature = motorTemperature;
+        telemetryTx.rpm = motorRPM;
+        esp_now_send(remoteMac, (uint8_t *)&telemetryTx, sizeof(telemetryTx));
+    }
+}
+
+void printDebug() 
+{
+    static unsigned long timer = 0;
+    if(millis() - timer < 500) return;
+    timer = millis();
+
+    Serial.print("Gas: "); Serial.print(rx.throttle);
+    Serial.print(" Steering: "); Serial.print(rx.steering);
+    Serial.print(" RPM: "); Serial.print(motorRPM);
+    Serial.print(" Temp: "); Serial.print(motorTemperature); Serial.print("C");
+    Serial.print(" Low:"); Serial.print(rx.lowBeam);
+    Serial.print(" High:"); Serial.print(rx.highBeam);
+    Serial.print(" Left:"); Serial.print(rx.leftBlink);
+    Serial.print(" Right:"); Serial.print(rx.rightBlink);
+    Serial.print(" Hazard:"); Serial.print(rx.hazard);
+    Serial.print(" Horn:"); Serial.print(rx.horn);
+    Serial.print(" Failsafe:"); Serial.println(failsafeActive);
+}
+
+void failsafe() 
+{
+    failsafeActive = true;
+    stopMotor();
+    steeringServo.write(90);
+    digitalWrite(LOW_BEAM_PIN, LOW);
+    digitalWrite(HIGH_BEAM_PIN, LOW);
+    digitalWrite(REVERSE_PIN, LOW);
+    analogWrite(TAIL_PIN, LOW);
+    // LEFT_PIN и RIGHT_PIN управляются через updateLights() с failsafeActive
+}
+
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
+void loop() 
+{
+    if(millis() - lastPacketTime > SIGNAL_TIMEOUT) 
+    {
+        failsafe();
+    }
+
+    updateServo();
+    updateMotor();
+    updateLights();
+    updateTelemetry();
+    printDebug();
+}

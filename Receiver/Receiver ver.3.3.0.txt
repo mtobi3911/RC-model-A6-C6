@@ -1,0 +1,277 @@
+// ============================================================================
+// Audi A6 C6 RC Project
+// Remote.ino
+// Version 3.3.0 (Без туманок, правильная распиновка для ESP32-C3)
+// ============================================================================
+#include <WiFi.h>
+#include <esp_now.h>
+
+// ============================================================================
+// RECEIVER MAC
+// ============================================================================
+uint8_t receiverMac[] = 
+{ 
+    0xA8, 0x46, 0x74, 0x78, 0x94, 0x90 
+};
+
+// ============================================================================
+// PINOUT (ESP32-C3 SuperMini) - БЕЗ ТУМАНОК
+// ============================================================================
+#define GAS_PIN             2    // ADC1_CH2
+#define STEER_PIN           3    // ADC1_CH3
+#define LOW_BEAM_SW         4
+#define HIGH_BEAM_SW        5
+#define LEFT_SW             6
+#define RIGHT_SW            7
+#define HAZARD_SW           10
+#define HORN_SW             9
+// FOG_SW удалён - туманки не используются
+
+// ============================================================================
+// SETTINGS
+// ============================================================================
+#define HEARTBEAT_TIME      300
+#define FILTER              0.15f
+#define DEADZONE            10
+
+// ============================================================================
+// PACKET (без fog)
+// ============================================================================
+typedef struct 
+{
+    uint16_t throttle;
+    uint16_t steering;
+    bool lowBeam;
+    bool highBeam;
+    bool leftBlink;
+    bool rightBlink;
+    bool hazard;
+    // bool fog;  <-- УДАЛЕНО
+    bool horn;
+    uint8_t reserved;
+} Packet;
+
+// ============================================================================
+// VARIABLES
+// ============================================================================
+Packet tx;
+Packet previous;
+TelemetryPacket telemetryRx;
+
+float throttleFiltered = 2048;
+float steeringFiltered = 2048;
+int throttleRaw;
+int steeringRaw;
+
+unsigned long heartbeatTimer = 0;
+
+bool leftState = false;
+bool rightState = false;
+bool hazardState = false;
+
+bool leftLast = HIGH;
+bool rightLast = HIGH;
+bool hazardLast = HIGH;
+unsigned long leftDebounce = 0;
+unsigned long rightDebounce = 0;
+unsigned long hazardDebounce = 0;
+const uint16_t debounceTime = 40;
+
+// ============================================================================
+// CALLBACKS
+// ============================================================================
+void onSend(const wifi_tx_info_t *info, esp_now_send_status_t status) 
+{
+}
+
+void onReceiveTelemetry(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) 
+{
+    if (len == sizeof(TelemetryPacket)) 
+    {
+        memcpy(&telemetryRx, incomingData, sizeof(TelemetryPacket));
+    }
+}
+
+// ============================================================================
+// LOGIC
+// ============================================================================
+bool changed() 
+{
+    if(abs((int)tx.throttle-(int)previous.throttle) > DEADZONE) return true;
+    if(abs((int)tx.steering-(int)previous.steering) > DEADZONE) return true;
+    if(tx.lowBeam != previous.lowBeam) return true;
+    if(tx.highBeam != previous.highBeam) return true;
+    if(tx.leftBlink != previous.leftBlink) return true;
+    if(tx.rightBlink != previous.rightBlink) return true;
+    if(tx.hazard != previous.hazard) return true;
+    // if(tx.fog != previous.fog) return true;  <-- УДАЛЕНО
+    if(tx.horn != previous.horn) return true;
+    return false;
+}
+
+void copyPacket() 
+{
+    previous = tx;
+}
+
+// ============================================================================
+// SETUP
+// ============================================================================
+void setup() 
+{
+    Serial.begin(115200);
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+
+    Serial.print("Remote MAC: ");
+    Serial.println(WiFi.macAddress());
+
+    pinMode(LOW_BEAM_SW, INPUT_PULLUP);
+    pinMode(HIGH_BEAM_SW, INPUT_PULLUP);
+    pinMode(LEFT_SW, INPUT_PULLUP);
+    pinMode(RIGHT_SW, INPUT_PULLUP);
+    // pinMode(FOG_SW, INPUT_PULLUP);  <-- УДАЛЕНО
+    pinMode(HAZARD_SW, INPUT_PULLUP);
+    pinMode(HORN_SW, INPUT_PULLUP);
+
+    analogReadResolution(12);
+
+    if(esp_now_init() != ESP_OK) 
+    {
+        Serial.println("ESP-NOW init failed");
+        while(true);
+    }
+
+    esp_now_register_send_cb(onSend);
+    esp_now_register_recv_cb(onReceiveTelemetry);
+
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, receiverMac, 6);
+    peer.channel = 0;
+    peer.encrypt = false;
+    
+    if(esp_now_add_peer(&peer) != ESP_OK)
+    {
+        Serial.println("Failed to add receiver peer");
+    }
+}
+
+// ============================================================================
+// LOOP FUNCTIONS
+// ============================================================================
+void readSticks() 
+{
+    throttleRaw = analogRead(GAS_PIN);
+    steeringRaw = analogRead(STEER_PIN);
+    
+    throttleFiltered = throttleFiltered * (1.0f - FILTER) + throttleRaw * FILTER;
+    steeringFiltered = steeringFiltered * (1.0f - FILTER) + steeringRaw * FILTER;
+    
+    tx.throttle = (uint16_t)throttleFiltered;
+    tx.steering = (uint16_t)steeringFiltered;
+}
+
+void readLights() 
+{
+    tx.lowBeam = !digitalRead(LOW_BEAM_SW);
+    tx.highBeam = !digitalRead(HIGH_BEAM_SW);
+    // tx.fog = !digitalRead(FOG_SW);  <-- УДАЛЕНО
+    tx.horn = !digitalRead(HORN_SW);
+}
+
+void updateBlinkButtons() 
+{
+    bool left = !digitalRead(LEFT_SW);
+    bool right = !digitalRead(RIGHT_SW);
+    bool hazard = !digitalRead(HAZARD_SW);
+
+    if(left != leftLast) { leftDebounce = millis(); leftLast = left; }
+    if(right != rightLast) { rightDebounce = millis(); rightLast = right; }
+    if(hazard != hazardLast) { hazardDebounce = millis(); hazardLast = hazard; }
+
+    if(millis() - leftDebounce > debounceTime) 
+    {
+        static bool old = false;
+        if(left && !old) 
+        {
+            leftState = !leftState;
+            rightState = false;
+            hazardState = false;
+        }
+        old = left;
+    }
+
+    if(millis() - rightDebounce > debounceTime) 
+    {
+        static bool old = false;
+        if(right && !old) 
+        {
+            rightState = !rightState;
+            leftState = false;
+            hazardState = false;
+        }
+        old = right;
+    }
+
+    if(millis() - hazardDebounce > debounceTime) 
+    {
+        static bool old = false;
+        if(hazard && !old) 
+        {
+            hazardState = !hazardState;
+            leftState = false;
+            rightState = false;
+        }
+        old = hazard;
+    }
+
+    tx.leftBlink = leftState;
+    tx.rightBlink = rightState;
+    tx.hazard = hazardState;
+}
+
+void sendPacket() 
+{
+    esp_now_send(receiverMac, (uint8_t *)&tx, sizeof(tx));
+    copyPacket();
+    heartbeatTimer = millis();
+}
+
+void printDebug() 
+{
+    static unsigned long timer = 0;
+    if (millis() - timer < 250) return;
+    timer = millis();
+
+    Serial.print("Gas: "); Serial.print(tx.throttle);
+    Serial.print("  Steer: "); Serial.print(tx.steering);
+    Serial.print(" | RPM: "); Serial.print(telemetryRx.rpm);
+    Serial.print("  Temp: "); Serial.print(telemetryRx.temperature); Serial.print("C");
+    Serial.print(" | L:"); Serial.print(tx.leftBlink);
+    Serial.print(" R:"); Serial.print(tx.rightBlink);
+    Serial.print(" H:"); Serial.print(tx.hazard);
+    // Serial.print(" Fog:"); Serial.print(tx.fog);  <-- УДАЛЕНО
+    Serial.print(" Horn:"); Serial.println(tx.horn);
+}
+
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
+void loop() 
+{
+    readSticks();
+    readLights();
+    updateBlinkButtons();
+
+    if (changed()) 
+    {
+        sendPacket(); 
+    } 
+    else if (millis() - heartbeatTimer > HEARTBEAT_TIME) 
+    {
+        sendPacket(); 
+    }
+
+    printDebug();
+}

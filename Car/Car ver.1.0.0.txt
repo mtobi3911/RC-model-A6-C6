@@ -1,0 +1,81 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <ESP32Servo.h>
+
+typedef struct {
+  uint16_t throttle;
+  uint16_t steering;
+
+  bool headlights;
+  bool brake;
+} DataPacket;
+
+DataPacket data;
+
+Servo servo;
+
+// ===== ПИН =====
+const int SERVO_PIN = 3;
+
+// ===== FAILSAFE =====
+unsigned long lastPacket = 0;
+
+// ===== ФИЛЬТР =====
+float angleF = 90;
+
+void onRecv(const esp_now_recv_info_t *info,
+            const uint8_t *incoming,
+            int len){
+
+  memcpy(&data, incoming, sizeof(data));
+  lastPacket = millis();
+}
+
+void setup(){
+
+  Serial.begin(115200);
+
+  WiFi.mode(WIFI_STA);
+
+  servo.attach(SERVO_PIN, 500, 2400);
+
+  if(esp_now_init()!=ESP_OK){
+    Serial.println("ESP FAIL");
+    return;
+  }
+
+  esp_now_register_recv_cb(onRecv);
+
+  Serial.println("READY");
+}
+
+void loop(){
+
+  // ===== FAILSAFE =====
+  if(millis()-lastPacket>500){
+    angleF = angleF*0.9 + 90*0.1;
+    servo.write((int)angleF);
+    return;
+  }
+
+  // ===== руль =====
+  int angle = map(data.steering, 0, 4095, 20, 160);
+  angle = constrain(angle, 20, 160);
+
+  // фильтр
+  angleF = angleF*0.85 + angle*0.15;
+
+  servo.write((int)angleF);
+
+  // ===== DEBUG =====
+  static unsigned long t=0;
+  if(millis()-t>500){
+    Serial.print("T:");
+    Serial.print(data.throttle);
+    Serial.print(" S:");
+    Serial.println(data.steering);
+    t=millis();
+  }
+
+  delay(5);
+}

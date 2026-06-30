@@ -1,0 +1,216 @@
+#include <WiFi.h>
+#include <esp_now.h>
+
+// =====================
+// MAC ПРИЁМНИКА
+// =====================
+
+uint8_t receiverMac[] =
+{
+  0xA8, 0x46, 0x74,
+  0x78, 0x94, 0x90
+};
+
+// =====================
+// СТРУКТУРА ДАННЫХ
+// =====================
+
+typedef struct
+{
+  uint16_t throttle;
+  uint16_t steering;
+}
+DataPacket;
+
+DataPacket data;
+
+// =====================
+// ПИНЫ
+// =====================
+
+const int THROTTLE_PIN = 2; // газ
+const int STEERING_PIN = 3; // руль
+
+// =====================
+// ФИЛЬТРЫ
+// =====================
+
+float filteredThrottle = 2048;
+float filteredSteering = 2048;
+
+// последние отправленные значения
+
+int lastSentThrottle = 2048;
+int lastSentSteering = 2048;
+
+// =====================
+// HEARTBEAT
+// =====================
+
+unsigned long lastSendTime = 0;
+
+const unsigned long HEARTBEAT_TIME = 300;
+
+// =====================
+// CALLBACK
+// =====================
+
+void OnDataSent(const uint8_t *mac_addr,
+                esp_now_send_status_t status)
+{
+  if(status == ESP_NOW_SEND_SUCCESS)
+  {
+    // можно убрать
+    // Serial.println("OK");
+  }
+  else
+  {
+    Serial.println("SEND FAIL");
+  }
+}
+
+// =====================
+// УСРЕДНЕНИЕ АЦП
+// =====================
+
+int readSmooth(int pin)
+{
+  long sum = 0;
+
+  for(int i = 0; i < 10; i++)
+  {
+    sum += analogRead(pin);
+
+    delayMicroseconds(200);
+  }
+
+  return sum / 10;
+}
+
+// =====================
+// SETUP
+// =====================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  Serial.print("MY MAC: ");
+  Serial.println(WiFi.macAddress());
+
+  if (esp_now_init() != ESP_OK)
+  {
+    Serial.println("ESP NOW ERROR");
+    return;
+  }
+
+  esp_now_register_send_cb(OnDataSent);
+
+  esp_now_peer_info_t peerInfo = {};
+
+  memcpy(peerInfo.peer_addr,
+         receiverMac,
+         6);
+
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK)
+  {
+    Serial.println("PEER ERROR");
+    return;
+  }
+
+  Serial.println("PULT READY");
+}
+
+// =====================
+// LOOP
+// =====================
+
+void loop()
+{
+  // -----------------
+  // читаем потенциометры
+  // -----------------
+
+  int rawThrottle =
+      readSmooth(THROTTLE_PIN);
+
+  int rawSteering =
+      readSmooth(STEERING_PIN);
+
+  // -----------------
+  // фильтрация
+  // -----------------
+
+  filteredThrottle =
+      filteredThrottle * 0.85 +
+      rawThrottle * 0.15;
+
+  filteredSteering =
+      filteredSteering * 0.85 +
+      rawSteering * 0.15;
+
+  int throttle =
+      (int)filteredThrottle;
+
+  int steering =
+      (int)filteredSteering;
+
+  // -----------------
+  // проверяем изменения
+  // -----------------
+
+  bool changed =
+      abs(throttle -
+          lastSentThrottle) > 8 ||
+
+      abs(steering -
+          lastSentSteering) > 8;
+
+  // -----------------
+  // heartbeat
+  // -----------------
+
+  bool heartbeat =
+      millis() -
+      lastSendTime >
+      HEARTBEAT_TIME;
+
+  // -----------------
+  // отправка
+  // -----------------
+
+  if(changed || heartbeat)
+  {
+    data.throttle = throttle;
+    data.steering = steering;
+
+    esp_now_send(
+      receiverMac,
+      (uint8_t*)&data,
+      sizeof(data)
+    );
+
+    lastSentThrottle =
+        throttle;
+
+    lastSentSteering =
+        steering;
+
+    lastSendTime =
+        millis();
+
+    Serial.print("Gas=");
+    Serial.print(throttle);
+
+    Serial.print(" Steering=");
+    Serial.println(steering);
+  }
+
+  delay(5);
+}

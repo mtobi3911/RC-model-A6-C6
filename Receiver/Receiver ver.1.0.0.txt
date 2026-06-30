@@ -1,0 +1,174 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <ESP32Servo.h>
+
+struct DataPacket
+{
+  uint16_t throttle;
+  uint16_t steering;
+};
+
+DataPacket data;
+
+// -------------------- ПИНЫ --------------------
+
+const int SERVO_PIN = 4;
+
+const int MOTOR_IN1 = 5;
+const int MOTOR_IN2 = 6;
+
+// -------------------- СЕРВА --------------------
+
+Servo steeringServo;
+
+// -------------------- FAILSAFE --------------------
+
+unsigned long lastPacketTime = 0;
+
+// -------------------- РЕЖИМЫ --------------------
+
+enum DriveState
+{
+  FORWARD_MODE,
+  NEUTRAL_MODE,
+  REVERSE_MODE
+};
+
+DriveState driveState = NEUTRAL_MODE;
+
+// -------------------- PWM --------------------
+
+const int PWM_FREQ = 1000;
+const int PWM_RES  = 8;
+
+void stopMotor()
+{
+  ledcWrite(MOTOR_IN1, 0);
+  ledcWrite(MOTOR_IN2, 0);
+}
+
+void motorForward(int speedValue)
+{
+  ledcWrite(MOTOR_IN1, speedValue);
+  ledcWrite(MOTOR_IN2, 0);
+}
+
+void motorReverse(int speedValue)
+{
+  ledcWrite(MOTOR_IN1, 0);
+  ledcWrite(MOTOR_IN2, speedValue);
+}
+
+// -------------------- ПРИЕМ ДАННЫХ --------------------
+
+void onReceive(const esp_now_recv_info_t *info,
+               const uint8_t *incomingData,
+               int len)
+{
+  memcpy(&data, incomingData, sizeof(data));
+
+  lastPacketTime = millis();
+}
+
+// -------------------- SETUP --------------------
+
+void setup()
+{
+  Serial.begin(115200);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  steeringServo.setPeriodHertz(50);
+  steeringServo.attach(SERVO_PIN, 500, 2400);
+
+  ledcAttach(MOTOR_IN1, PWM_FREQ, PWM_RES);
+  ledcAttach(MOTOR_IN2, PWM_FREQ, PWM_RES);
+
+  if (esp_now_init() != ESP_OK)
+  {
+    Serial.println("ESP NOW ERROR");
+    return;
+  }
+
+  esp_now_register_recv_cb(onReceive);
+
+  Serial.println("RECEIVER READY");
+}
+
+// -------------------- LOOP --------------------
+
+void loop()
+{
+  // FAILSAFE
+
+  if (millis() - lastPacketTime > 500)
+  {
+    stopMotor();
+    steeringServo.write(90);
+    return;
+  }
+
+  // ---------- РУЛЬ ----------
+
+  int angle = map(data.steering,
+                  0, 4095,
+                  0, 180);
+
+  angle = constrain(angle, 0, 180);
+
+  steeringServo.write(angle);
+
+  // ---------- ГАЗ ----------
+
+  int center = 2048;
+  int deadZone = 150;
+
+  int throttle = data.throttle;
+
+  // ВПЕРЕД
+
+  if (throttle > center + deadZone)
+  {
+    int speedValue = map(throttle,
+                         center + deadZone,
+                         4095,
+                         0,
+                         255);
+
+    driveState = FORWARD_MODE;
+
+    motorForward(speedValue);
+  }
+
+  // НАЗАД
+
+  else if (throttle < center - deadZone)
+  {
+    int speedValue = map(throttle,
+                         center - deadZone,
+                         0,
+                         0,
+                         255);
+
+    if (driveState == FORWARD_MODE)
+    {
+      stopMotor();
+      driveState = NEUTRAL_MODE;
+    }
+    else
+    {
+      driveState = REVERSE_MODE;
+      motorReverse(speedValue);
+    }
+  }
+
+  // НЕЙТРАЛЬ
+
+  else
+  {
+    stopMotor();
+  }
+
+  delay(10);
+}

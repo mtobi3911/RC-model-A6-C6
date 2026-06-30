@@ -1,0 +1,523 @@
+// ============================================================================
+// Audi A6 C6 RC Project
+// Receiver.ino
+// Version 2.0.0
+// ESP32-C3 SuperMini
+// ============================================================================
+
+#include <WiFi.h>
+#include <esp_now.h>
+#include <ESP32Servo.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ============================================================================
+// PINOUT
+// ============================================================================
+
+#define SERVO_PIN          4
+
+#define LOW_BEAM_PIN       8
+#define HIGH_BEAM_PIN      9
+
+#define LEFT_PIN          10
+#define RIGHT_PIN          0
+
+#define TAIL_PIN           1
+#define REVERSE_PIN        3
+
+#define HALL_PIN           5
+#define TEMP_PIN           6
+
+#define MOTOR_IN1         20
+#define MOTOR_IN2         21
+
+// ============================================================================
+// SETTINGS
+// ============================================================================
+
+#define SIGNAL_TIMEOUT    800
+
+#define BLINK_INTERVAL    500
+
+#define SERVO_FILTER      0.20f
+
+#define MOTOR_DEADZONE    40
+
+#define BRAKE_BRIGHTNESS  255
+
+#define TAIL_BRIGHTNESS    70
+
+// ============================================================================
+
+typedef struct
+{
+    uint16_t throttle;
+    uint16_t steering;
+
+    bool lowBeam;
+    bool highBeam;
+
+    bool leftBlink;
+    bool rightBlink;
+
+    bool hazard;
+
+    bool fog;
+
+    bool horn;
+
+    uint8_t reserved;
+
+} Packet;
+
+// ============================================================================
+
+Packet rx;
+
+// ============================================================================
+
+Servo steeringServo;
+
+OneWire oneWire(TEMP_PIN);
+
+DallasTemperature sensors(&oneWire);
+
+// ============================================================================
+
+volatile uint32_t hallCounter = 0;
+
+unsigned long lastPacketTime = 0;
+
+unsigned long blinkTimer = 0;
+
+bool blinkState = false;
+
+// ============================================================================
+
+float servoFiltered = 90.0f;
+
+bool reverseEnabled = false;
+
+bool brakeMode = false;
+
+// ============================================================================
+
+float motorTemperature = 0.0f;
+
+uint32_t motorRPM = 0;
+
+// ============================================================================
+
+void IRAM_ATTR hallInterrupt()
+{
+    hallCounter++;
+}
+
+// ============================================================================
+
+void onReceive(const esp_now_recv_info_t *info,
+               const uint8_t *incomingData,
+               int len)
+{
+    if(len!=sizeof(Packet))
+        return;
+
+    memcpy(&rx,incomingData,sizeof(Packet));
+
+    lastPacketTime=millis();
+}
+
+// ============================================================================
+
+void setup()
+{
+
+    Serial.begin(115200);
+
+    WiFi.mode(WIFI_STA);
+
+    WiFi.disconnect();
+
+    steeringServo.setPeriodHertz(50);
+
+    steeringServo.attach(
+        SERVO_PIN,
+        500,
+        2400
+    );
+
+    pinMode(LOW_BEAM_PIN,OUTPUT);
+
+    pinMode(HIGH_BEAM_PIN,OUTPUT);
+
+    pinMode(LEFT_PIN,OUTPUT);
+
+    pinMode(RIGHT_PIN,OUTPUT);
+
+    pinMode(TAIL_PIN,OUTPUT);
+
+    pinMode(REVERSE_PIN,OUTPUT);
+
+    pinMode(MOTOR_IN1,OUTPUT);
+
+    pinMode(MOTOR_IN2,OUTPUT);
+
+    pinMode(HALL_PIN,INPUT_PULLUP);
+
+    attachInterrupt(
+        digitalPinToInterrupt(HALL_PIN),
+        hallInterrupt,
+        FALLING
+    );
+
+    sensors.begin();
+
+    if(esp_now_init()!=ESP_OK)
+    {
+        while(true);
+    }
+
+    esp_now_register_recv_cb(onReceive);
+
+}
+
+// ============================================================================
+
+void updateServo()
+{
+
+    int angle=map(
+        rx.steering,
+        0,
+        4095,
+        0,
+        180
+    );
+
+    servoFiltered=
+        servoFiltered*(1.0f-SERVO_FILTER)+
+        angle*SERVO_FILTER;
+
+    steeringServo.write(
+        constrain(
+            servoFiltered,
+            0,
+            180
+        )
+    );
+
+}
+
+// ============================================================================
+
+void updateLights()
+{
+
+    digitalWrite(
+        LOW_BEAM_PIN,
+        rx.lowBeam
+    );
+
+    digitalWrite(
+        HIGH_BEAM_PIN,
+        rx.highBeam
+    );
+
+    if(millis()-blinkTimer>BLINK_INTERVAL)
+    {
+        blinkTimer=millis();
+
+        blinkState=!blinkState;
+    }
+
+    bool left=false;
+
+    bool right=false;
+
+    if(rx.hazard)
+    {
+        left=blinkState;
+        right=blinkState;
+    }
+    else
+    {
+        left=
+            rx.leftBlink &&
+            blinkState;
+
+        right=
+            rx.rightBlink &&
+            blinkState;
+    }
+
+    digitalWrite(
+        LEFT_PIN,
+        left
+    );
+
+    digitalWrite(
+        RIGHT_PIN,
+        right
+    );
+
+}
+// ============================================================================
+
+void stopMotor()
+{
+    digitalWrite(MOTOR_IN1, LOW);
+    digitalWrite(MOTOR_IN2, LOW);
+}
+
+// ============================================================================
+
+void motorForward(uint8_t pwm)
+{
+    analogWrite(MOTOR_IN1, pwm);
+    digitalWrite(MOTOR_IN2, LOW);
+}
+
+// ============================================================================
+
+void motorReverse(uint8_t pwm)
+{
+    digitalWrite(MOTOR_IN1, LOW);
+    analogWrite(MOTOR_IN2, pwm);
+}
+
+// ============================================================================
+
+void updateMotor()
+{
+    int value = map(rx.throttle, 0, 4095, -255, 255);
+
+    // ==========================================
+    // 1. МЁРТВАЯ ЗОНА (НЕЙТРАЛЬ)
+    // ==========================================
+    if(abs(value) < MOTOR_DEADZONE)
+    {
+        stopMotor();
+        brakeMode = false;
+        analogWrite(TAIL_PIN, TAIL_BRIGHTNESS);
+        digitalWrite(REVERSE_PIN, LOW);
+
+        // КЛЮЧЕВОЙ МОМЕНТ:
+        // Разрешаем задний ход ТОЛЬКО здесь — в нейтрали.
+        // Это классическая RC-логика: чтобы поехать назад,
+        // стик ДОЛЖЕН пройти через нейтраль.
+        reverseEnabled = true;
+        return;
+    }
+
+    // ==========================================
+    // 2. ДВИЖЕНИЕ ВПЕРЁД
+    // ==========================================
+    if(value > 0)
+    {
+        // Как только трогаемся вперёд — запрещаем задний ход.
+        // Теперь, чтобы поехать назад, нужно СНАЧАЛА
+        // отпустить стик в нейтраль.
+        reverseEnabled = false;
+        brakeMode = false;
+        motorForward(value);
+        analogWrite(TAIL_PIN, TAIL_BRIGHTNESS);
+        digitalWrite(REVERSE_PIN, LOW);
+        return;
+    }
+
+    // ==========================================
+    // 3. СТИК ТЯНЕТСЯ НАЗАД (value < 0)
+    // ==========================================
+    if(!reverseEnabled)
+    {
+        // Мы ехали вперёд и потянули стик назад,
+        // но через нейтраль ещё НЕ проходили.
+        // Значит, СНАЧАЛА тормозим.
+        stopMotor();
+        brakeMode = true;
+        analogWrite(TAIL_PIN, BRAKE_BRIGHTNESS);
+        digitalWrite(REVERSE_PIN, LOW);
+
+        // ⚠️ ВАЖНО: reverseEnabled НЕ трогаем!
+        // Он останется false, и машинка будет
+        // продолжать тормозить, пока стик
+        // не вернётся в нейтраль.
+        //
+        // В оригинале здесь было reverseEnabled = true,
+        // и из-за этого "торможение" длилось ровно
+        // один цикл loop() (~1-5 мс) — машинка просто
+        // дёргалась и ехала назад.
+        return;
+    }
+
+    // reverseEnabled == true — стик был в нейтрали,
+    // значит можно включать задний ход.
+    brakeMode = false;
+    motorReverse(abs(value));
+    analogWrite(TAIL_PIN, TAIL_BRIGHTNESS);
+    digitalWrite(REVERSE_PIN, HIGH);
+}
+
+// ============================================================================
+
+void updateTelemetry()
+{
+
+    static unsigned long tempTimer = 0;
+
+    static unsigned long rpmTimer = 0;
+
+    if(millis()-tempTimer>1000)
+    {
+
+        tempTimer=millis();
+
+        sensors.requestTemperatures();
+
+        motorTemperature=
+            sensors.getTempCByIndex(0);
+
+    }
+
+    if(millis()-rpmTimer>1000)
+    {
+
+        rpmTimer=millis();
+
+        noInterrupts();
+
+        uint32_t pulses=hallCounter;
+
+        hallCounter=0;
+
+        interrupts();
+
+        motorRPM=pulses*60;
+
+    }
+
+}
+
+// ============================================================================
+
+void printDebug()
+{
+
+    static unsigned long timer=0;
+
+    if(millis()-timer<500)
+        return;
+
+    timer=millis();
+
+    Serial.print("Gas: ");
+
+    Serial.print(rx.throttle);
+
+    Serial.print(" Steering: ");
+
+    Serial.print(rx.steering);
+
+    Serial.print(" RPM: ");
+
+    Serial.print(motorRPM);
+
+    Serial.print(" Temp: ");
+
+    Serial.print(motorTemperature);
+
+    Serial.print("C");
+
+    Serial.print(" Low:");
+
+    Serial.print(rx.lowBeam);
+
+    Serial.print(" High:");
+
+    Serial.print(rx.highBeam);
+
+    Serial.print(" Left:");
+
+    Serial.print(rx.leftBlink);
+
+    Serial.print(" Right:");
+
+    Serial.print(rx.rightBlink);
+
+    Serial.print(" Hazard:");
+
+    Serial.println(rx.hazard);
+
+}
+
+// ============================================================================
+
+void failsafe()
+{
+
+    stopMotor();
+
+    steeringServo.write(90);
+
+    digitalWrite(
+        LOW_BEAM_PIN,
+        LOW
+    );
+
+    digitalWrite(
+        HIGH_BEAM_PIN,
+        LOW
+    );
+
+    digitalWrite(
+        LEFT_PIN,
+        LOW
+    );
+
+    digitalWrite(
+        RIGHT_PIN,
+        LOW
+    );
+
+    digitalWrite(
+        REVERSE_PIN,
+        LOW
+    );
+
+    analogWrite(
+        TAIL_PIN,
+        LOW
+    );
+
+}
+
+// ============================================================================
+
+void loop()
+{
+
+    if(millis()-lastPacketTime>SIGNAL_TIMEOUT)
+    {
+        failsafe();
+
+        return;
+    }
+
+    updateServo();
+
+    updateMotor();
+
+    updateLights();
+
+    updateTelemetry();
+
+    printDebug();
+
+}
+
+// ============================================================================
+//
+//                            END OF FILE
+//
+// ============================================================================

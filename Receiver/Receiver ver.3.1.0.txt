@@ -1,0 +1,384 @@
+//=============================================================================
+// Audi A6 C6 RC
+// Remote.ino
+// Version 3.1.0
+// Part 1/5
+//=============================================================================
+
+#include <WiFi.h>
+#include <esp_now.h>
+
+//=============================================================================
+// RECEIVER MAC
+//=============================================================================
+
+uint8_t receiverMAC[] =
+{
+    0xA8,
+    0x46,
+    0x74,
+    0x78,
+    0x94,
+    0x90
+};
+
+//=============================================================================
+// ANALOG INPUTS
+//=============================================================================
+
+#define PIN_GAS             21
+#define PIN_STEERING        20
+
+//=============================================================================
+// SWITCHES
+//=============================================================================
+
+#define PIN_LOW_BEAM        8
+#define PIN_HIGH_BEAM       9
+
+#define PIN_LEFT            10
+#define PIN_RIGHT           0
+
+#define PIN_FOG             1
+#define PIN_HAZARD          3
+
+#define PIN_HORN            4
+
+//=============================================================================
+// SETTINGS
+//=============================================================================
+
+#define ADC_MAX             4095
+
+#define FILTER_ALPHA        0.18f
+
+#define DEAD_ZONE           8
+
+#define HEARTBEAT_TIME      100
+
+#define SEND_INTERVAL       15
+
+#define BUTTON_DEBOUNCE     40
+
+//=============================================================================
+// PACKET VERSION
+//=============================================================================
+
+#define PACKET_VERSION      2
+
+//=============================================================================
+// DATA PACKET
+//=============================================================================
+
+typedef struct
+{
+    uint8_t version;
+
+    uint16_t packetID;
+
+    uint16_t throttle;
+
+    uint16_t steering;
+
+    bool lowBeam;
+
+    bool highBeam;
+
+    bool fog;
+
+    bool leftBlink;
+
+    bool rightBlink;
+
+    bool hazard;
+
+    bool horn;
+
+    uint8_t crc;
+
+} Packet;
+
+Packet tx;
+Packet previous;
+
+//=============================================================================
+
+float throttleFiltered = 2048.0f;
+float steeringFiltered = 2048.0f;
+
+int throttleRaw = 2048;
+int steeringRaw = 2048;
+
+//=============================================================================
+
+unsigned long heartbeatTimer = 0;
+unsigned long sendTimer = 0;
+
+//=============================================================================
+
+uint16_t packetCounter = 0;
+
+//=============================================================================
+
+bool leftState = false;
+bool rightState = false;
+bool hazardState = false;
+
+//=============================================================================
+
+bool leftOld = false;
+bool rightOld = false;
+bool hazardOld = false;
+
+//=============================================================================
+
+unsigned long leftTime = 0;
+unsigned long rightTime = 0;
+unsigned long hazardTime = 0;
+
+//=============================================================================
+
+void onDataSent(const wifi_tx_info_t *info,
+                esp_now_send_status_t status)
+{
+
+}
+
+//=============================================================================
+
+uint8_t calculateCRC(Packet &p)
+{
+
+    uint8_t crc = 0;
+
+    uint8_t *ptr = (uint8_t*)&p;
+
+    for(int i=0;i<sizeof(Packet)-1;i++)
+    {
+        crc ^= ptr[i];
+    }
+
+    return crc;
+
+}
+
+//=============================================================================
+
+bool packetChanged()
+{
+
+    if(abs((int)tx.throttle-(int)previous.throttle)>DEAD_ZONE)
+        return true;
+
+    if(abs((int)tx.steering-(int)previous.steering)>DEAD_ZONE)
+        return true;
+
+    if(tx.lowBeam!=previous.lowBeam)
+        return true;
+
+    if(tx.highBeam!=previous.highBeam)
+        return true;
+
+    if(tx.fog!=previous.fog)
+        return true;
+
+    if(tx.leftBlink!=previous.leftBlink)
+        return true;
+
+    if(tx.rightBlink!=previous.rightBlink)
+        return true;
+
+    if(tx.hazard!=previous.hazard)
+        return true;
+
+    if(tx.horn!=previous.horn)
+        return true;
+
+    return false;
+
+}
+
+//=============================================================================
+
+void copyPacket()
+{
+
+    previous = tx;
+
+}
+
+//=============================================================================
+
+void setup()
+{
+
+    Serial.begin(115200);
+
+    WiFi.mode(WIFI_STA);
+
+    WiFi.disconnect();
+
+    analogReadResolution(12);
+
+    pinMode(PIN_LOW_BEAM,INPUT_PULLUP);
+    pinMode(PIN_HIGH_BEAM,INPUT_PULLUP);
+
+    pinMode(PIN_LEFT,INPUT_PULLUP);
+    pinMode(PIN_RIGHT,INPUT_PULLUP);
+
+    pinMode(PIN_FOG,INPUT_PULLUP);
+
+    pinMode(PIN_HAZARD,INPUT_PULLUP);
+
+    pinMode(PIN_HORN,INPUT_PULLUP);
+
+    if(esp_now_init()!=ESP_OK)
+    {
+        while(true);
+    }
+
+    esp_now_register_send_cb(onDataSent);
+
+    esp_now_peer_info_t peer={};
+
+    memcpy(peer.peer_addr,receiverMAC,6);
+
+    peer.channel=0;
+
+    peer.encrypt=false;
+
+    esp_now_add_peer(&peer);
+
+    tx.version=PACKET_VERSION;
+
+}
+
+//=============================================================================
+//=============================================================================
+// CONTROLLER LOOP
+//=============================================================================
+
+void readInputs()
+{
+
+    throttleRaw = analogRead(PIN_GAS);
+    steeringRaw = analogRead(PIN_STEERING);
+
+    throttleFiltered =
+        throttleFiltered * (1.0f - FILTER_ALPHA) +
+        throttleRaw * FILTER_ALPHA;
+
+    steeringFiltered =
+        steeringFiltered * (1.0f - FILTER_ALPHA) +
+        steeringRaw * FILTER_ALPHA;
+
+    tx.throttle = (uint16_t)throttleFiltered;
+    tx.steering = (uint16_t)steeringFiltered;
+
+}
+
+//=============================================================================
+
+void readButtons()
+{
+
+    tx.lowBeam  = !digitalRead(PIN_LOW_BEAM);
+    tx.highBeam = !digitalRead(PIN_HIGH_BEAM);
+    tx.fog      = !digitalRead(PIN_FOG);
+    tx.horn     = !digitalRead(PIN_HORN);
+
+}
+
+//=============================================================================
+
+void updateBlinkers()
+{
+
+    bool left  = !digitalRead(PIN_LEFT);
+    bool right = !digitalRead(PIN_RIGHT);
+    bool hz    = !digitalRead(PIN_HAZARD);
+
+    if(left && !leftOld && millis() - leftTime > BUTTON_DEBOUNCE)
+    {
+        leftState = !leftState;
+        rightState = false;
+        hazardState = false;
+        leftTime = millis();
+    }
+
+    if(right && !rightOld && millis() - rightTime > BUTTON_DEBOUNCE)
+    {
+        rightState = !rightState;
+        leftState = false;
+        hazardState = false;
+        rightTime = millis();
+    }
+
+    if(hz && !hazardOld && millis() - hazardTime > BUTTON_DEBOUNCE)
+    {
+        hazardState = !hazardState;
+        leftState = false;
+        rightState = false;
+        hazardTime = millis();
+    }
+
+    leftOld = left;
+    rightOld = right;
+    hazardOld = hz;
+
+    tx.leftBlink  = leftState;
+    tx.rightBlink = rightState;
+    tx.hazard     = hazardState;
+
+}
+
+//=============================================================================
+
+void sendData()
+{
+
+    tx.packetID++;
+
+    tx.crc = calculateCRC(tx);
+
+    esp_now_send(
+        receiverMAC,
+        (uint8_t*)&tx,
+        sizeof(tx)
+    );
+
+    copyPacket();
+
+    sendTimer = millis();
+
+}
+
+//=============================================================================
+
+void loop()
+{
+
+    readInputs();
+    readButtons();
+    updateBlinkers();
+
+    bool needSend = false;
+
+    if(packetChanged())
+        needSend = true;
+
+    if(millis() - heartbeatTimer > HEARTBEAT_TIME)
+        needSend = true;
+
+    if(needSend && millis() - sendTimer > SEND_INTERVAL)
+    {
+        sendData();
+    }
+
+    heartbeatTimer = millis();
+
+}
+
+//=============================================================================
+// END OF FILE
+//=============================================================================

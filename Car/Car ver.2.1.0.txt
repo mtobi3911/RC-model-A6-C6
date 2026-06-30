@@ -1,0 +1,336 @@
+//=============================================================================
+// Audi A6 C6 RC
+// Receiver.ino
+// Version 2.1.0
+// Part 1/6
+//=============================================================================
+
+#include <WiFi.h>
+#include <esp_now.h>
+#include <ESP32Servo.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+//=============================================================================
+// PINOUT
+//=============================================================================
+
+#define SERVO_PIN       4
+
+#define LOW_BEAM_PIN    8
+#define HIGH_BEAM_PIN   9
+
+#define LEFT_PIN       10
+#define RIGHT_PIN       0
+
+#define FOG_PIN         1
+#define HAZARD_PIN      3
+
+#define TAIL_PIN        2   // PWM (changed from your free pin pool assumption)
+
+// Motor driver MX1508
+#define MOTOR_IN1      20
+#define MOTOR_IN2      21
+
+// Sensors
+#define HALL_PIN        5
+#define TEMP_PIN        6
+
+//=============================================================================
+// SETTINGS
+//=============================================================================
+
+#define SIGNAL_TIMEOUT   800
+
+#define BLINK_INTERVAL   500
+
+#define SERVO_ALPHA      0.18f
+
+#define MOTOR_DEADZONE   35
+
+#define PWM_FREQ         20000
+
+#define PWM_RES          8   // 0–255
+
+//=============================================================================
+// ESP-NOW PACKET
+//=============================================================================
+
+typedef struct
+{
+    uint8_t version;
+    uint16_t packetID;
+
+    uint16_t throttle;
+    uint16_t steering;
+
+    bool lowBeam;
+    bool highBeam;
+
+    bool fog;
+
+    bool leftBlink;
+    bool rightBlink;
+    bool hazard;
+
+    bool horn;
+
+    uint8_t crc;
+
+} Packet;
+
+Packet rx;
+
+//=============================================================================
+
+Servo steeringServo;
+
+//=============================================================================
+
+OneWire oneWire(TEMP_PIN);
+DallasTemperature tempSensor(&oneWire);
+
+//=============================================================================
+
+volatile uint32_t hallCounter = 0;
+
+//=============================================================================
+
+unsigned long lastPacketTime = 0;
+unsigned long blinkTimer = 0;
+
+bool blinkState = false;
+
+//=============================================================================
+
+float servoFiltered = 90.0f;
+
+//=============================================================================
+
+uint8_t motorChannelA = 0;
+uint8_t motorChannelB = 1;
+uint8_t tailChannel   = 2;
+
+//=============================================================================
+
+bool reverseArmed = false;
+
+//=============================================================================
+
+void IRAM_ATTR hallISR()
+{
+    hallCounter++;
+}
+
+//=============================================================================
+
+void onReceive(const esp_now_recv_info_t *info,
+               const uint8_t *data,
+               int len)
+{
+    if(len != sizeof(Packet))
+        return;
+
+    memcpy(&rx, data, sizeof(Packet));
+
+    lastPacketTime = millis();
+}
+
+//=============================================================================
+
+void setup()
+{
+    Serial.begin(115200);
+
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+
+    analogReadResolution(12);
+
+    steeringServo.setPeriodHertz(50);
+    steeringServo.attach(SERVO_PIN, 500, 2400);
+
+    pinMode(HALL_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(HALL_PIN), hallISR, FALLING);
+
+    pinMode(LOW_BEAM_PIN, OUTPUT);
+    pinMode(HIGH_BEAM_PIN, OUTPUT);
+    pinMode(LEFT_PIN, OUTPUT);
+    pinMode(RIGHT_PIN, OUTPUT);
+    pinMode(FOG_PIN, OUTPUT);
+    pinMode(HAZARD_PIN, OUTPUT);
+
+    // LEDC PWM setup
+    ledcSetup(motorChannelA, PWM_FREQ, PWM_RES);
+    ledcSetup(motorChannelB, PWM_FREQ, PWM_RES);
+    ledcSetup(tailChannel, 1000, PWM_RES);
+
+    ledcAttachPin(MOTOR_IN1, motorChannelA);
+    ledcAttachPin(MOTOR_IN2, motorChannelB);
+    ledcAttachPin(TAIL_PIN, tailChannel);
+
+    tempSensor.begin();
+
+    if(esp_now_init() != ESP_OK)
+    {
+        while(true);
+    }
+
+    esp_now_register_recv_cb(onReceive);
+}
+
+//=============================================================================
+//=============================================================================
+// MOTOR CONTROL
+//=============================================================================
+
+void motorStop()
+{
+    ledcWrite(motorChannelA, 0);
+    ledcWrite(motorChannelB, 0);
+}
+
+//=============================================================================
+
+void motorForward(uint8_t pwm)
+{
+    ledcWrite(motorChannelA, pwm);
+    ledcWrite(motorChannelB, 0);
+}
+
+//=============================================================================
+
+void motorReverse(uint8_t pwm)
+{
+    ledcWrite(motorChannelA, 0);
+    ledcWrite(motorChannelB, pwm);
+}
+
+//=============================================================================
+
+void updateMotor()
+{
+    int value = map(rx.throttle, 0, 4095, -255, 255);
+
+    if(abs(value) < MOTOR_DEADZONE)
+    {
+        motorStop();
+        reverseArmed = true;
+        return;
+    }
+
+    // FORWARD
+    if(value > 0)
+    {
+        reverseArmed = false;
+        motorForward((uint8_t)value);
+        return;
+    }
+
+    // REVERSE LOGIC (2-step safety)
+    if(value < 0)
+    {
+        if(!reverseArmed)
+        {
+            motorStop();
+            reverseArmed = true;
+            return;
+        }
+
+        motorReverse((uint8_t)abs(value));
+    }
+}
+
+//=============================================================================
+
+void updateServo()
+{
+    int angle = map(rx.steering, 0, 4095, 0, 180);
+
+    servoFiltered =
+        servoFiltered * (1.0f - SERVO_ALPHA) +
+        angle * SERVO_ALPHA;
+
+    steeringServo.write((int)servoFiltered);
+}
+
+//=============================================================================
+
+void updateLights()
+{
+    digitalWrite(LOW_BEAM_PIN,  rx.lowBeam);
+    digitalWrite(HIGH_BEAM_PIN, rx.highBeam);
+    digitalWrite(FOG_PIN,       rx.fog);
+}
+
+//=============================================================================
+
+void updateBlinkers()
+{
+    if(millis() - blinkTimer > BLINK_INTERVAL)
+    {
+        blinkTimer = millis();
+        blinkState = !blinkState;
+    }
+
+    bool left  = rx.leftBlink  && blinkState;
+    bool right = rx.rightBlink && blinkState;
+
+    if(rx.hazard)
+    {
+        left = blinkState;
+        right = blinkState;
+    }
+
+    digitalWrite(LEFT_PIN, left);
+    digitalWrite(RIGHT_PIN, right);
+}
+
+//=============================================================================
+
+void updateTelemetry()
+{
+    static unsigned long t1 = 0;
+
+    if(millis() - t1 > 1000)
+    {
+        t1 = millis();
+        tempSensor.requestTemperatures();
+    }
+}
+
+//=============================================================================
+
+void failsafe()
+{
+    motorStop();
+
+    steeringServo.write(90);
+
+    digitalWrite(LOW_BEAM_PIN, LOW);
+    digitalWrite(HIGH_BEAM_PIN, LOW);
+    digitalWrite(LEFT_PIN, LOW);
+    digitalWrite(RIGHT_PIN, LOW);
+    digitalWrite(FOG_PIN, LOW);
+}
+
+//=============================================================================
+
+void loop()
+{
+    if(millis() - lastPacketTime > SIGNAL_TIMEOUT)
+    {
+        failsafe();
+        return;
+    }
+
+    updateServo();
+    updateMotor();
+    updateLights();
+    updateBlinkers();
+    updateTelemetry();
+}
+
+//=============================================================================
+// END OF FILE
+//=============================================================================
